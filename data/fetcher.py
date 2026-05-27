@@ -98,11 +98,14 @@ def fetch_one_stock(code: str) -> pd.DataFrame | None:
     cache_file = os.path.join(CACHE_DIR, f"{code}.csv")
 
     if os.path.exists(cache_file):
-        df = pd.read_csv(cache_file, parse_dates=["date"])
-        last_date = df["date"].max()
-        if pd.Timestamp(last_date) >= pd.Timestamp.now() - pd.Timedelta(days=7):
-            return df
-        start_date = (pd.Timestamp(last_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+        df = _load_cache_or_none(cache_file)
+        if df is not None:
+            last_date = df["date"].max()
+            if pd.Timestamp(last_date) >= pd.Timestamp.now() - pd.Timedelta(days=7):
+                return df
+            start_date = (pd.Timestamp(last_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+        else:
+            start_date = pd.Timestamp(BACKTEST_START).strftime("%Y-%m-%d")
     else:
         start_date = pd.Timestamp(BACKTEST_START).strftime("%Y-%m-%d")
 
@@ -135,8 +138,9 @@ def fetch_one_stock(code: str) -> pd.DataFrame | None:
         df = df.dropna(subset=["open", "close"])
 
         if os.path.exists(cache_file):
-            old = pd.read_csv(cache_file, parse_dates=["date"])
-            df = pd.concat([old, df]).drop_duplicates("date").sort_values("date")
+            old = _load_cache_or_none(cache_file)
+            if old is not None:
+                df = pd.concat([old, df]).drop_duplicates("date").sort_values("date")
 
         df.to_csv(cache_file, index=False)
         return df
@@ -146,8 +150,17 @@ def fetch_one_stock(code: str) -> pd.DataFrame | None:
 
 
 def _load_cache_or_none(cache_file: str) -> pd.DataFrame | None:
+    """安全读取缓存文件，损坏文件自动删除。"""
     if os.path.exists(cache_file):
-        return pd.read_csv(cache_file, parse_dates=["date"])
+        try:
+            df = pd.read_csv(cache_file, parse_dates=["date"])
+            if "date" not in df.columns:
+                os.remove(cache_file)
+                return None
+            return df
+        except Exception:
+            os.remove(cache_file)
+            return None
     return None
 
 
@@ -181,7 +194,9 @@ def fetch_index_data(code: str) -> pd.DataFrame | None:
     _bs_login()
     cache_file = os.path.join(CACHE_DIR, f"index_{code}.csv")
     if os.path.exists(cache_file):
-        return pd.read_csv(cache_file, parse_dates=["date"])
+        df = _load_cache_or_none(cache_file)
+        if df is not None:
+            return df
 
     try:
         rs = bs.query_history_k_data_plus(
