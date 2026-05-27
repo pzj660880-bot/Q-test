@@ -13,12 +13,22 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 def _safe_ak_call(func, *args, **kwargs):
-    """统一异常包装：超时、网络错误均捕获，返回空DataFrame。"""
-    try:
-        return func(*args, **kwargs)
-    except Exception as e:
-        print(f"  [WARN] akshare调用失败 {func.__name__}: {e}")
-        return pd.DataFrame()
+    """带重试的akshare调用：最多3次，指数退避。"""
+    max_retries = 3
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            result = func(*args, **kwargs)
+            if result is not None and not (hasattr(result, "empty") and result.empty):
+                return result
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait = (attempt + 1) * 2  # 2s, 4s, 6s
+                time.sleep(wait)
+    if last_error:
+        print(f"  [WARN] akshare调用失败 {func.__name__}: {last_error}")
+    return pd.DataFrame()
 
 
 def get_index_constituents(index_code: str) -> pd.DataFrame:
@@ -143,22 +153,21 @@ def _load_cache_or_none(cache_file: str) -> pd.DataFrame | None:
 
 
 def fetch_all_stocks(codes: list[str]) -> dict[str, pd.DataFrame]:
-    """分批拉取全量数据。
+    """分批拉取全量数据，每只股票间隔0.3秒防限流。
 
     Returns:
         {code: DataFrame} 字典，拉取失败的code不会出现在结果中
     """
     result = {}
     total = len(codes)
-    for i in range(0, total, FETCH_BATCH_SIZE):
-        batch = codes[i:i + FETCH_BATCH_SIZE]
-        print(f"  拉取批次 [{i+1}-{min(i+FETCH_BATCH_SIZE, total)}] / {total}")
-        for code in batch:
-            df = fetch_one_stock(code)
-            if df is not None and not df.empty:
-                result[code] = df
-        if i + FETCH_BATCH_SIZE < total:
-            time.sleep(FETCH_BATCH_SLEEP)
+    sleep_per_stock = 0.3  # 每只股票间隔300ms
+    for i, code in enumerate(codes):
+        if (i + 1) % 20 == 0 or i == 0:
+            print(f"  进度 [{i+1}/{total}] ({(i+1)/total*100:.0f}%)")
+        df = fetch_one_stock(code)
+        if df is not None and not df.empty:
+            result[code] = df
+        time.sleep(sleep_per_stock)
     print(f"  成功拉取 {len(result)} / {total} 只股票数据")
     return result
 
