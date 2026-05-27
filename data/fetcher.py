@@ -21,60 +21,65 @@ def _safe_ak_call(func, *args, **kwargs):
         return pd.DataFrame()
 
 
-def get_index_constituents(index_code: str) -> list[str]:
-    """获取指数成分股列表。
+def get_index_constituents(index_code: str) -> pd.DataFrame:
+    """获取指数成分股列表（含代码+名称，用于ST过滤）。
 
     Args:
         index_code: '000300'(沪深300) 或 '000905'(中证500)
 
     Returns:
-        股票代码列表，如 ['000001', '000002', ...]
+        DataFrame with columns: code, name
     """
     cache_file = os.path.join(CACHE_DIR, f"constituents_{index_code}.csv")
     if os.path.exists(cache_file):
-        df = pd.read_csv(cache_file, dtype={"code": str})
-        return df["code"].tolist()
+        df = pd.read_csv(cache_file, dtype={"code": str, "name": str})
+        if "name" in df.columns:
+            return df
 
     try:
         if index_code == "000300":
-            df = ak.index_stock_cons_csindex(symbol="000300")
+            raw = ak.index_stock_cons_csindex(symbol="000300")
         else:
-            df = ak.index_stock_cons_csindex(symbol="000905")
-        codes = df["成分券代码"].astype(str).str.zfill(6).tolist()
-        pd.DataFrame({"code": codes}).to_csv(cache_file, index=False)
-        print(f"  获取 {index_code} 成分股 {len(codes)} 只")
-        return codes
+            raw = ak.index_stock_cons_csindex(symbol="000905")
+        df = pd.DataFrame({
+            "code": raw["成分券代码"].astype(str).str.zfill(6),
+            "name": raw["成分券名称"].astype(str),
+        })
+        df.to_csv(cache_file, index=False)
+        print(f"  获取 {index_code} 成分股 {len(df)} 只")
+        return df
     except Exception as e:
         print(f"  [ERROR] 获取成分股失败 {index_code}: {e}")
-        return []
+        return pd.DataFrame(columns=["code", "name"])
 
 
 def build_stock_pool() -> list[str]:
-    """构建选股池：合并指数成分股，去重，过滤ST和上市不足新股。"""
-    all_codes = []
-    for idx in STOCK_POOL_INDICES:
-        codes = get_index_constituents(idx)
-        all_codes.extend(codes)
-    all_codes = list(dict.fromkeys(all_codes))  # 去重保序
-    print(f"合并成分股 {len(all_codes)} 只（去重后）")
+    """构建选股池：合并指数成分股，去重，从成分股名称过滤ST。
 
-    # 剔除ST
+    指数成分股数据自带股票名称，直接通过名称前缀过滤ST，
+    无需逐只调用API，Phase 1从20分钟缩短到秒级。
+    指数纳入规则已隐含上市时间要求，不再单独过滤。
+    """
+    all_rows = []
+    seen = set()
+    for idx in STOCK_POOL_INDICES:
+        df = get_index_constituents(idx)
+        for _, row in df.iterrows():
+            code = row["code"]
+            if code not in seen:
+                seen.add(code)
+                all_rows.append(row)
+    print(f"合并成分股 {len(all_rows)} 只（去重后）")
+
     filtered = []
-    for code in all_codes:
-        try:
-            info = _safe_ak_call(ak.stock_individual_info_em, symbol=code)
-            if info is None or info.empty:
-                continue
-            name = str(info.loc[info["item"] == "股票简称", "value"].values[0]) if not info.empty else ""
-            if name.startswith(EXCLUDE_ST_PREFIX):
-                continue
-            listed_date = info.loc[info["item"] == "上市时间", "value"].values[0]
-            if pd.to_datetime(listed_date) > pd.Timestamp(BACKTEST_START) - pd.Timedelta(days=MIN_LISTING_DAYS):
-                continue
-            filtered.append(code)
-        except Exception:
+    for row in all_rows:
+        name = str(row.get("name", ""))
+        if name.startswith(EXCLUDE_ST_PREFIX):
             continue
-    print(f"过滤ST/新股后: {len(filtered)} 只")
+        filtered.append(row["code"])
+
+    st_count = len(all_rows) - len(filtered)
+    print(f"剔除ST: {st_count} 只, 最终选股池: {len(filtered)} 只")
     return filtered
 
 
