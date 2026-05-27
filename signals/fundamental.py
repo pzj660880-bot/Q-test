@@ -1,71 +1,70 @@
-"""估值过滤信号：PE/PB/ROE三维评估，输出0-10分。"""
+"""估值过滤信号：PE/PB评估，输出0-10分。使用baostock数据源。"""
 import pandas as pd
-import akshare as ak
-from config import PB_MAX, ROE_MIN, PE_SECTOR_DISCOUNT
+import baostock as bs
+from config import PB_MAX, PE_SECTOR_DISCOUNT
 
 
 def _get_fundamentals(codes: list[str]) -> pd.DataFrame:
-    """批量获取股票基本面数据。
+    """批量获取股票基本面数据（PE/PB/行业）。
 
-    PE/PB通过akshare的stock_zh_a_spot_em()一次获取全市场数据，
-    ROE和行业通过stock_individual_info_em逐只获取（仅需获取一次，缓存后复用）。
-    逐只请求控制在50只/批，避免限流。
+    从baostock日线K线数据中提取最新PE/PB值，从query_stock_industry获取行业分类。
     """
-    codes_set = set(codes)
+    bs.login()
     records = []
+    end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
+    start_date = (pd.Timestamp.now() - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
 
-    # 批量获取PE/PB（全市场一次调用）
-    try:
-        spot = ak.stock_zh_a_spot_em()
-        if spot is not None and not spot.empty:
-            spot["代码"] = spot["代码"].astype(str)
-            spot = spot[spot["代码"].isin(codes_set)]
-            for _, r in spot.iterrows():
-                records.append({
-                    "code": r["代码"],
-                    "pe": pd.to_numeric(r.get("市盈率-动态"), errors="coerce"),
-                    "pb": pd.to_numeric(r.get("市净率"), errors="coerce"),
-                })
-    except Exception as e:
-        print(f"  [WARN] 批量获取PE/PB失败: {e}")
+    for code in codes:
+        try:
+            bs_code = f"sh.{code}" if code.startswith("6") else f"sz.{code}"
 
-    df = pd.DataFrame(records) if records else pd.DataFrame(columns=["code", "pe", "pb"])
-
-    # 逐只获取ROE和行业（分批，每批50只）
-    roe_sector_records = []
-    all_codes = list(codes_set)
-    for i in range(0, len(all_codes), 50):
-        batch = all_codes[i:i+50]
-        for code in batch:
-            try:
-                info = ak.stock_individual_info_em(symbol=code)
-                if info is None or info.empty:
-                    continue
-                row = {"code": code}
-                for _, r in info.iterrows():
-                    if r["item"] == "净资产收益率":
-                        row["roe"] = pd.to_numeric(r["value"], errors="coerce")
-                    elif r["item"] == "行业":
-                        row["sector"] = r["value"]
-                roe_sector_records.append(row)
-            except Exception:
+            # PE/PB从日线数据提取（取最近有效值）
+            rs = bs.query_history_k_data_plus(
+                bs_code, "date,peTTM,pbMRQ",
+                start_date=start_date, end_date=end_date,
+                frequency="d", adjustflag="1"
+            )
+            if rs.error_code != "0":
                 continue
 
-    right_df = pd.DataFrame(roe_sector_records)
-    if not right_df.empty and not df.empty:
-        df = df.merge(right_df, on="code", how="left")
-    elif not right_df.empty:
-        df = right_df
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
 
-    return df
+            pe = pb = None
+            for r in reversed(rows):
+                pe_val = float(r[1]) if r[1] and r[1] != "0.000000" else 0
+                pb_val = float(r[2]) if r[2] and r[2] != "0.000000" else 0
+                if pe_val > 0 and pe is None:
+                    pe = pe_val
+                if pb_val > 0 and pb is None:
+                    pb = pb_val
+                if pe is not None and pb is not None:
+                    break
+
+            # 行业分类
+            sector = ""
+            try:
+                rs_ind = bs.query_stock_industry(code=bs_code)
+                if rs_ind.error_code == "0":
+                    ind_rows = []
+                    while rs_ind.next():
+                        ind_rows.append(rs_ind.get_row_data())
+                    if ind_rows:
+                        sector = ind_rows[-1][2]
+            except Exception:
+                pass
+
+            records.append({"code": code, "pe": pe, "pb": pb, "sector": sector})
+        except Exception:
+            continue
+
+    bs.logout()
+    return pd.DataFrame(records) if records else pd.DataFrame(columns=["code", "pe", "pb", "sector"])
 
 
 def compute_sector_pe_medians(fund_df: pd.DataFrame) -> dict[str, float]:
-    """计算各行业PE中位数。
-
-    Returns:
-        {sector_name: median_pe}
-    """
+    """计算各行业PE中位数。"""
     if "sector" not in fund_df.columns or "pe" not in fund_df.columns:
         return {}
     valid = fund_df.dropna(subset=["sector", "pe"])
@@ -76,38 +75,31 @@ def compute_sector_pe_medians(fund_df: pd.DataFrame) -> dict[str, float]:
 def score_fundamental(code: str, fund_df: pd.DataFrame, sector_pe: dict[str, float]) -> float:
     """计算单只股票的估值得分。
 
-    Args:
-        code: 股票代码
-        fund_df: 所有股票的基本面DataFrame
-        sector_pe: 行业PE中位数映射
-
-    Returns:
-        0-10分
+    PE低估得5分，PB合理得5分，满分10。无数据给中性5分。
     """
     row = fund_df[fund_df["code"] == code]
     if row.empty:
-        return 5.0  # 无数据给中性分
+        return 5.0
 
     row = row.iloc[0]
     score = 0.0
 
     pe = row.get("pe")
     pb = row.get("pb")
-    roe = row.get("roe")
     sector = row.get("sector")
 
-    # 1. PE低估 (+4)
+    # PE低估：低于行业中位数80% (+5)
     if pd.notna(pe) and pe > 0 and sector and sector in sector_pe:
         median = sector_pe[sector]
         if median > 0 and pe < median * PE_SECTOR_DISCOUNT:
-            score += 4.0
+            score += 5.0
+        elif pe < median:
+            score += 2.5  # 不显著低估但也不算贵
 
-    # 2. PB合理 (+3)
+    # PB合理 (+5)
     if pd.notna(pb) and 0 < pb < PB_MAX:
-        score += 3.0
-
-    # 3. ROE过关 (+3) — akshare返回的ROE是百分比（如15表示15%）
-    if pd.notna(roe) and roe > 0 and roe / 100 > ROE_MIN:
-        score += 3.0
+        score += 5.0
+    elif pd.notna(pb) and pb > 0 and pb < PB_MAX * 1.5:
+        score += 2.5  # 略高但可接受
 
     return score

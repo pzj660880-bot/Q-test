@@ -1,41 +1,41 @@
-"""数据拉取模块：从akshare获取A股日线数据，本地CSV缓存，批量拉取防限流。"""
+"""数据拉取模块：baostock获取个股日线 + akshare获取指数/成分股，本地CSV缓存。"""
 import os
 import time
 import pandas as pd
+import baostock as bs
 import akshare as ak
 from config import (
-    CACHE_DIR, FETCH_BATCH_SIZE, FETCH_BATCH_SLEEP,
-    API_TIMEOUT, STOCK_POOL_INDICES, BACKTEST_START, BACKTEST_END,
+    CACHE_DIR, STOCK_POOL_INDICES, BACKTEST_START, BACKTEST_END,
     BENCHMARK_INDEX, SHANGHAI_INDEX, MIN_LISTING_DAYS, EXCLUDE_ST_PREFIX,
 )
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# baostock 全局登录
+_BS_LOGGED_IN = False
 
-def _safe_ak_call(func, *args, **kwargs):
-    """带重试的akshare调用：最多3次，指数退避。"""
-    max_retries = 3
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            result = func(*args, **kwargs)
-            if result is not None and not (hasattr(result, "empty") and result.empty):
-                return result
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                wait = (attempt + 1) * 2  # 2s, 4s, 6s
-                time.sleep(wait)
-    if last_error:
-        print(f"  [WARN] akshare调用失败 {func.__name__}: {last_error}")
-    return pd.DataFrame()
+
+def _bs_login():
+    global _BS_LOGGED_IN
+    if not _BS_LOGGED_IN:
+        bs.login()
+        _BS_LOGGED_IN = True
+
+
+def _bs_logout():
+    global _BS_LOGGED_IN
+    if _BS_LOGGED_IN:
+        bs.logout()
+        _BS_LOGGED_IN = False
+
+
+def _code_to_bs(code: str) -> str:
+    """将6位代码转为baostock格式。6开头=上海(sh)，其余=深圳(sz)。"""
+    return f"sh.{code}" if code.startswith("6") else f"sz.{code}"
 
 
 def get_index_constituents(index_code: str) -> pd.DataFrame:
     """获取指数成分股列表（含代码+名称，用于ST过滤）。
-
-    Args:
-        index_code: '000300'(沪深300) 或 '000905'(中证500)
 
     Returns:
         DataFrame with columns: code, name
@@ -64,12 +64,7 @@ def get_index_constituents(index_code: str) -> pd.DataFrame:
 
 
 def build_stock_pool() -> list[str]:
-    """构建选股池：合并指数成分股，去重，从成分股名称过滤ST。
-
-    指数成分股数据自带股票名称，直接通过名称前缀过滤ST，
-    无需逐只调用API，Phase 1从20分钟缩短到秒级。
-    指数纳入规则已隐含上市时间要求，不再单独过滤。
-    """
+    """构建选股池：合并指数成分股，去重，从成分股名称过滤ST。"""
     all_rows = []
     seen = set()
     for idx in STOCK_POOL_INDICES:
@@ -94,7 +89,7 @@ def build_stock_pool() -> list[str]:
 
 
 def fetch_one_stock(code: str) -> pd.DataFrame | None:
-    """拉取单只股票日线数据（后复权），缓存到CSV。
+    """拉取单只股票日线数据（后复权），缓存到CSV。使用baostock数据源。
 
     Returns:
         DataFrame columns: date, open, high, low, close, volume, amount
@@ -102,39 +97,43 @@ def fetch_one_stock(code: str) -> pd.DataFrame | None:
     """
     cache_file = os.path.join(CACHE_DIR, f"{code}.csv")
 
-    # 检查缓存
     if os.path.exists(cache_file):
         df = pd.read_csv(cache_file, parse_dates=["date"])
         last_date = df["date"].max()
         if pd.Timestamp(last_date) >= pd.Timestamp.now() - pd.Timedelta(days=7):
             return df
-        # 增量更新：拉取最近数据
-        start_date = (pd.Timestamp(last_date) - pd.Timedelta(days=10)).strftime("%Y%m%d")
+        start_date = (pd.Timestamp(last_date) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
     else:
-        start_date = pd.Timestamp(BACKTEST_START).strftime("%Y%m%d")
+        start_date = pd.Timestamp(BACKTEST_START).strftime("%Y-%m-%d")
 
-    end_date = pd.Timestamp.now().strftime("%Y%m%d")
+    end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
     try:
-        raw = _safe_ak_call(
-            ak.stock_zh_a_hist,
-            symbol=code, period="daily",
+        _bs_login()
+        rs = bs.query_history_k_data_plus(
+            _code_to_bs(code),
+            "date,open,high,low,close,volume,amount",
             start_date=start_date, end_date=end_date,
-            adjust="hfq"  # 后复权
+            frequency="d", adjustflag="1"  # 1=后复权
         )
-        if raw is None or raw.empty:
+        if rs.error_code != "0":
             return _load_cache_or_none(cache_file)
 
-        df = raw.rename(columns={
-            "日期": "date", "开盘": "open", "最高": "high",
-            "最低": "low", "收盘": "close", "成交量": "volume",
-            "成交额": "amount",
-        })
-        df["date"] = pd.to_datetime(df["date"])
-        keep_cols = ["date", "open", "high", "low", "close", "volume", "amount"]
-        df = df[[c for c in keep_cols if c in df.columns]]
+        rows = []
+        while rs.next():
+            rows.append(rs.get_row_data())
 
-        # 合并已有缓存
+        if not rows:
+            return _load_cache_or_none(cache_file)
+
+        df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume", "amount"])
+        df["date"] = pd.to_datetime(df["date"])
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # 删除全为NaN的行（停牌日baostock可能返回空行）
+        df = df.dropna(subset=["open", "close"])
+
         if os.path.exists(cache_file):
             old = pd.read_csv(cache_file, parse_dates=["date"])
             df = pd.concat([old, df]).drop_duplicates("date").sort_values("date")
@@ -153,39 +152,59 @@ def _load_cache_or_none(cache_file: str) -> pd.DataFrame | None:
 
 
 def fetch_all_stocks(codes: list[str]) -> dict[str, pd.DataFrame]:
-    """分批拉取全量数据，每只股票间隔0.3秒防限流。
+    """分批次拉取全量数据。baostock不需要长间隔，0.1s即可。
 
     Returns:
-        {code: DataFrame} 字典，拉取失败的code不会出现在结果中
+        {code: DataFrame} 字典
     """
+    _bs_login()
     result = {}
     total = len(codes)
-    sleep_per_stock = 0.3  # 每只股票间隔300ms
     for i, code in enumerate(codes):
-        if (i + 1) % 20 == 0 or i == 0:
+        if (i + 1) % 50 == 0 or i == 0:
             print(f"  进度 [{i+1}/{total}] ({(i+1)/total*100:.0f}%)")
         df = fetch_one_stock(code)
         if df is not None and not df.empty:
             result[code] = df
-        time.sleep(sleep_per_stock)
+        time.sleep(0.1)  # baostock限速较宽松
+    _bs_logout()
     print(f"  成功拉取 {len(result)} / {total} 只股票数据")
     return result
 
 
 def fetch_index_data(code: str) -> pd.DataFrame | None:
-    """拉取指数日线数据（如沪深300=000300）。"""
+    """拉取指数日线数据（如沪深300=000300）。使用baostock。
+
+    Args:
+        code: 指数代码如 '000300'，自动加 sh 前缀
+    """
+    _bs_login()
     cache_file = os.path.join(CACHE_DIR, f"index_{code}.csv")
     if os.path.exists(cache_file):
         return pd.read_csv(cache_file, parse_dates=["date"])
 
     try:
-        df = ak.stock_zh_index_daily(symbol=f"sh{code}" if code.startswith("000") else f"sz{code}")
-        if df is None or df.empty:
+        rs = bs.query_history_k_data_plus(
+            f"sh.{code}",
+            "date,open,high,low,close,volume",
+            start_date=pd.Timestamp(BACKTEST_START).strftime("%Y-%m-%d"),
+            end_date=pd.Timestamp.now().strftime("%Y-%m-%d"),
+            frequency="d", adjustflag="1"
+        )
+        if rs.error_code != "0":
             return None
-        df = df.rename(columns={"date": "date", "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
+
+        rows = []
+        while rs.next():
+            rows.append(rs.get_row_data())
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"])
         df["date"] = pd.to_datetime(df["date"])
-        keep_cols = ["date", "open", "high", "low", "close", "volume"]
-        df = df[[c for c in keep_cols if c in df.columns]]
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["open", "close"])
         df.to_csv(cache_file, index=False)
         return df
     except Exception as e:
