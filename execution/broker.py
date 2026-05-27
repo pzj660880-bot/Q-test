@@ -14,8 +14,9 @@ def compute_fee(amount: float, is_sell: bool) -> float:
     return commission + stamp
 
 
-def _get_row(df: pd.DataFrame, date: pd.Timestamp, idx_map: dict | None = None):
-    """O(1)获取指定日期的行情行。idx_map为{date: row_index}预建索引。"""
+def _get_row(df: pd.DataFrame, date, idx_map: dict | None = None):
+    """O(1)获取指定日期的行情行。"""
+    date = pd.Timestamp(date)
     if idx_map is not None:
         i = idx_map.get(date)
         if i is not None:
@@ -25,15 +26,17 @@ def _get_row(df: pd.DataFrame, date: pd.Timestamp, idx_map: dict | None = None):
     return rows.iloc[0] if not rows.empty else None
 
 
-def _get_next_date(df: pd.DataFrame, date: pd.Timestamp, idx_map: dict | None = None):
+def _get_next_date(df: pd.DataFrame, date, idx_map: dict | None = None):
     """获取下一个交易日。"""
-    dates = df["date"]
+    date = pd.Timestamp(date)
     if idx_map is not None:
+        # idx_map keys are already pd.Timestamp, sort and find next
         all_dates = sorted(idx_map.keys())
         for d in all_dates:
             if d > date:
                 return d
         return None
+    dates = pd.to_datetime(df["date"])
     later = dates[dates > date]
     return later.iloc[0] if not later.empty else None
 
