@@ -154,20 +154,15 @@ def run_backtest(stock_data: dict, index_df: pd.DataFrame,
     from signals.fundamental import score_fundamental
     from risk.stop_loss import check_exits
 
-    # 预建 {code: {date: row_index}} — 一次性O(N)构建，后续O(1)查询
+    # 预建 {code: {pd.Timestamp: row_index}} — O(1)日期查询
     print("  构建日期索引...")
     idx_map = {}
     for code, df in stock_data.items():
         m = {}
-        dates = df["date"]
+        dates = pd.to_datetime(df["date"])
         for i in range(len(dates)):
             m[dates.iloc[i]] = i
         idx_map[code] = m
-
-    # 同样为指数数据建索引
-    idx_idx = {}
-    for i in range(len(index_df)):
-        idx_idx[index_df["date"].iloc[i]] = i
 
     signals_log = []
     total = len(trading_dates)
