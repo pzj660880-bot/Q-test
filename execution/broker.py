@@ -8,79 +8,79 @@ from config import (
 
 
 def compute_fee(amount: float, is_sell: bool) -> float:
-    """计算交易费用。
-
-    Args:
-        amount: 成交金额
-        is_sell: 是否卖出（卖出需印花税）
-
-    Returns:
-        总费用
-    """
+    """计算交易费用（佣金+印花税）。"""
     commission = max(amount * COMMISSION_RATE, COMMISSION_MIN)
     stamp = amount * STAMP_TAX_RATE if is_sell else 0.0
     return commission + stamp
 
 
-def can_buy(stock_df: pd.DataFrame, date: pd.Timestamp) -> bool:
-    """判断当日是否可以买入（非涨停、非停牌）。"""
-    row = stock_df[stock_df["date"] == date]
-    if row.empty:
+def _get_row(df: pd.DataFrame, date: pd.Timestamp, idx_map: dict | None = None):
+    """O(1)获取指定日期的行情行。idx_map为{date: row_index}预建索引。"""
+    if idx_map is not None:
+        i = idx_map.get(date)
+        if i is not None:
+            return df.iloc[i]
+        return None
+    rows = df[df["date"] == date]
+    return rows.iloc[0] if not rows.empty else None
+
+
+def _get_next_date(df: pd.DataFrame, date: pd.Timestamp, idx_map: dict | None = None):
+    """获取下一个交易日。"""
+    dates = df["date"]
+    if idx_map is not None:
+        all_dates = sorted(idx_map.keys())
+        for d in all_dates:
+            if d > date:
+                return d
+        return None
+    later = dates[dates > date]
+    return later.iloc[0] if not later.empty else None
+
+
+def can_buy(df: pd.DataFrame, date: pd.Timestamp, idx_map: dict | None = None) -> bool:
+    row = _get_row(df, date, idx_map)
+    if row is None:
         return False
-    row = row.iloc[0]
-    if row.get("is_suspended", False):
-        return False
-    if row.get("limit_up", False):
+    if row.get("is_suspended", False) or row.get("limit_up", False):
         return False
     return True
 
 
-def can_sell(stock_df: pd.DataFrame, date: pd.Timestamp) -> bool:
-    """判断当日是否可以卖出（非跌停、非停牌）。"""
-    row = stock_df[stock_df["date"] == date]
-    if row.empty:
+def can_sell(df: pd.DataFrame, date: pd.Timestamp, idx_map: dict | None = None) -> bool:
+    row = _get_row(df, date, idx_map)
+    if row is None:
         return False
-    row = row.iloc[0]
-    if row.get("is_suspended", False):
-        return False
-    if row.get("limit_down", False):
+    if row.get("is_suspended", False) or row.get("limit_down", False):
         return False
     return True
 
 
-def execute_buy(
-    portfolio, code: str, date: pd.Timestamp,
-    stock_data: dict[str, pd.DataFrame], max_positions: int,
-    signal_score: float,
-) -> bool:
-    """执行买入（T+1=次日开盘价成交）。
-
-    Returns:
-        True如果成功买入
-    """
+def execute_buy(portfolio, code: str, date: pd.Timestamp,
+                stock_data: dict, max_positions: int,
+                signal_score: float, idx_map: dict | None = None) -> bool:
+    """T+1买入：次日开盘价成交。"""
     df = stock_data.get(code)
     if df is None:
         return False
 
-    # 找到下一个交易日
-    next_dates = df[df["date"] > date]["date"]
-    if next_dates.empty:
-        return False
-    next_date = next_dates.iloc[0]
-
-    if not can_buy(df, next_date):
+    next_date = _get_next_date(df, date, idx_map)
+    if next_date is None:
         return False
 
-    row = df[df["date"] == next_date].iloc[0]
+    if not can_buy(df, next_date, idx_map):
+        return False
+
+    row = _get_row(df, next_date, idx_map)
+    if row is None:
+        return False
     price = row["open"]
     if pd.isna(price) or price <= 0:
         return False
 
-    # 仓位已满
     if len(portfolio.positions) >= max_positions:
         return False
 
-    # 计算买入数量
     remaining_slots = max_positions - len(portfolio.positions)
     if remaining_slots <= 0:
         return False
@@ -94,30 +94,25 @@ def execute_buy(
 
     amount = price * qty
     fee = compute_fee(amount, is_sell=False)
-    total_cost = amount + fee
-
-    if total_cost > portfolio.cash:
-        # 资金不足，减少1手重试
+    if amount + fee > portfolio.cash:
         qty -= LOT_SIZE
         if qty < LOT_SIZE:
             return False
         amount = price * qty
         fee = compute_fee(amount, is_sell=False)
-        total_cost = amount + fee
-        if total_cost > portfolio.cash:
+        if amount + fee > portfolio.cash:
             return False
 
-    portfolio.cash -= total_cost
+    portfolio.cash -= amount + fee
     portfolio.add_position(code, next_date, price, qty)
     portfolio.record_trade(next_date, code, "BUY", price, qty, amount, fee)
     return True
 
 
-def execute_sell(
-    portfolio, code: str, date: pd.Timestamp,
-    stock_data: dict[str, pd.DataFrame], reason: str = "",
-) -> bool:
-    """执行卖出（T+1=次日开盘价成交）。"""
+def execute_sell(portfolio, code: str, date: pd.Timestamp,
+                 stock_data: dict, reason: str = "",
+                 idx_map: dict | None = None) -> bool:
+    """T+1卖出：次日开盘价成交。"""
     pos = next((p for p in portfolio.positions if p["code"] == code), None)
     if pos is None:
         return False
@@ -126,15 +121,16 @@ def execute_sell(
     if df is None:
         return False
 
-    next_dates = df[df["date"] > date]["date"]
-    if next_dates.empty:
-        return False
-    next_date = next_dates.iloc[0]
-
-    if not can_sell(df, next_date):
+    next_date = _get_next_date(df, date, idx_map)
+    if next_date is None:
         return False
 
-    row = df[df["date"] == next_date].iloc[0]
+    if not can_sell(df, next_date, idx_map):
+        return False
+
+    row = _get_row(df, next_date, idx_map)
+    if row is None:
+        return False
     price = row["open"]
     if pd.isna(price) or price <= 0:
         return False
@@ -142,87 +138,86 @@ def execute_sell(
     qty = pos["quantity"]
     amount = price * qty
     fee = compute_fee(amount, is_sell=True)
-    net_amount = amount - fee
-
-    portfolio.cash += net_amount
+    portfolio.cash += amount - fee
     portfolio.remove_position(code)
     portfolio.record_trade(next_date, code, "SELL", price, qty, amount, fee)
     return True
 
 
-def run_backtest(
-    stock_data: dict[str, pd.DataFrame],
-    index_df: pd.DataFrame,
-    fund_df: pd.DataFrame,
-    sector_pe: dict[str, float],
-    trading_dates: pd.DatetimeIndex,
-    portfolio,
-) -> dict:
-    """主回测循环。
-
-    Returns:
-        回测结果字典 {nav_df, trades_df, signals_log}
-    """
+def run_backtest(stock_data: dict, index_df: pd.DataFrame,
+                 fund_df: pd.DataFrame, sector_pe: dict,
+                 trading_dates: pd.DatetimeIndex, portfolio) -> dict:
+    """主回测循环：预建日期索引，O(1)日期查找替代O(n)全表扫描。"""
     from signals.market_timing import get_market_state
     from signals.trend import score_trend
     from signals.volume import score_volume
     from signals.fundamental import score_fundamental
     from risk.stop_loss import check_exits
 
-    signals_log = []
+    # 预建 {code: {date: row_index}} — 一次性O(N)构建，后续O(1)查询
+    print("  构建日期索引...")
+    idx_map = {}
+    for code, df in stock_data.items():
+        m = {}
+        dates = df["date"]
+        for i in range(len(dates)):
+            m[dates.iloc[i]] = i
+        idx_map[code] = m
 
-    for i, date in enumerate(trading_dates):
+    # 同样为指数数据建索引
+    idx_idx = {}
+    for i in range(len(index_df)):
+        idx_idx[index_df["date"].iloc[i]] = i
+
+    signals_log = []
+    total = len(trading_dates)
+
+    for di, date in enumerate(trading_dates):
         if date < pd.Timestamp(BACKTEST_START) or date > pd.Timestamp(BACKTEST_END):
             continue
 
+        if (di + 1) % 200 == 0:
+            print(f"  回测 [{di+1}/{total}] ({(di+1)/total*100:.0f}%)")
+
         try:
-            # Step 1: 检查止损止盈
-            exits = check_exits(portfolio.positions, stock_data, date)
+            # Step 1: 止损止盈
+            exits = check_exits(portfolio.positions, stock_data, date, idx_map)
             for exit_order in exits:
-                execute_sell(portfolio, exit_order["code"], date, stock_data, exit_order["reason"])
+                execute_sell(portfolio, exit_order["code"], date, stock_data,
+                             exit_order["reason"], idx_map)
 
             # Step 2: 大盘择时
             state, max_pos = get_market_state(index_df, date)
 
-            # Step 3: 选股（仅当仓位未满且非空仓状态）
+            # Step 3: 选股
             if state != "empty" and len(portfolio.positions) < max_pos and portfolio.cash > 0:
+                held = {p["code"] for p in portfolio.positions}
                 scores = []
                 for code, df in stock_data.items():
-                    # 跳过已持仓
-                    if any(p["code"] == code for p in portfolio.positions):
+                    if code in held:
                         continue
-                    # 跳过数据不足
-                    idx = df[df["date"] == date].index
-                    if len(idx) == 0:
+                    i = idx_map.get(code, {}).get(date)
+                    if i is None:
                         continue
-                    idx = idx[0]
-
                     try:
-                        t_score = score_trend(df, idx)
-                        v_score = score_volume(df, idx)
-                        f_score = score_fundamental(code, fund_df, sector_pe)
-                        total = t_score + v_score + f_score
-                        if total >= 24:  # 信号阈值
-                            scores.append((code, total, t_score, v_score, f_score))
+                        ts = score_trend(df, i)
+                        vs = score_volume(df, i)
+                        fs = score_fundamental(code, fund_df, sector_pe)
+                        total = ts + vs + fs
+                        if total >= 24:
+                            scores.append((code, total, ts, vs, fs))
                     except Exception:
                         continue
 
-                # 按总分降序，买入前N只
                 scores.sort(key=lambda x: x[1], reverse=True)
-                for code, total, t_s, v_s, f_s in scores:
-                    if len(portfolio.positions) >= max_pos:
+                for code, total, ts, vs, fs in scores:
+                    if len(portfolio.positions) >= max_pos or portfolio.cash <= 0:
                         break
-                    if portfolio.cash <= 0:
-                        break
-                    success = execute_buy(portfolio, code, date, stock_data, max_pos, total)
-                    if success:
-                        signals_log.append({
-                            "date": date, "code": code, "total_score": total,
-                            "trend": t_s, "volume": v_s, "fundamental": f_s,
-                            "market_state": state,
-                        })
+                    ok = execute_buy(portfolio, code, date, stock_data, max_pos, total, idx_map)
+                    if ok:
+                        signals_log.append(dict(date=date, code=code, total_score=total,
+                            trend=ts, volume=vs, fundamental=fs, market_state=state))
 
-            # Step 4: 记录每日净值
             portfolio.record_nav(date, stock_data)
 
         except Exception as e:

@@ -7,16 +7,15 @@ def check_exits(
     positions: list[dict],
     stock_data: dict[str, pd.DataFrame],
     date: pd.Timestamp,
+    idx_map: dict | None = None,
 ) -> list[dict]:
     """检查所有持仓，返回需要卖出的列表。
 
     Args:
-        positions: 当前持仓列表，每项 {code, entry_date, entry_price, highest_price, quantity}
-        stock_data: {code: DataFrame} 全量数据
+        positions: [{code, entry_date, entry_price, highest_price, quantity}]
+        stock_data: {code: DataFrame}
         date: 当前日期
-
-    Returns:
-        需卖出的持仓列表 [{code, reason}]
+        idx_map: {code: {date: row_index}} 预建索引，启用O(1)查找
     """
     exits = []
     for pos in positions:
@@ -25,10 +24,17 @@ def check_exits(
         if df is None:
             continue
 
-        row = df[df["date"] == date]
-        if row.empty:
+        # O(1)索引查找，回退到O(n)扫描
+        if idx_map and code in idx_map:
+            i = idx_map[code].get(date)
+            row = df.iloc[i] if i is not None else None
+        else:
+            rows = df[df["date"] == date]
+            row = rows.iloc[0] if not rows.empty else None
+
+        if row is None:
             continue
-        current_price = row.iloc[0]["close"]
+        current_price = row["close"]
         if pd.isna(current_price) or current_price <= 0:
             continue
 
