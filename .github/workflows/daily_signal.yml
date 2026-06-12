@@ -2,7 +2,8 @@ name: 每日涨停板推荐
 
 on:
   schedule:
-    - cron: '30 6 * * 1-5'
+    # 北京时间 14:30 = UTC 06:30, 周一至周五
+    - cron: '30 6 * * 1,2,3,4,5'
   workflow_dispatch:
 
 jobs:
