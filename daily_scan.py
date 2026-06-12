@@ -3,10 +3,10 @@ import urllib.request, urllib.parse, json, datetime as dt
 
 TG_TOKEN = "8891262140:AAEDe-As4zW59GN-cp5nSyrt2M8nPeHtqrc"
 TG_CHAT = "2098753325"
-GAIN_MIN, GAIN_MAX = 9.0, 10.0
-VOL_MIN = 3.0
-SEAL_MIN = 0.998
-OPEN_MAX = 5.0
+GAIN_MIN, GAIN_MAX = 7.0, 9.5   # 7-9.5%：冲涨停中，还没封板能买入
+VOL_MIN = 2.5                   # 量比>2.5（比涨停版要求稍低）
+SEAL_MIN = 0.95                 # 收盘/最高>0.95（接近涨停但未完全封板）
+OPEN_MAX = 5.0                  # 开盘<5%（非一字板）
 MAX_PICKS = 3
 
 

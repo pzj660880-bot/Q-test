@@ -41,11 +41,11 @@ ALL_CACHE_DIR = os.path.join(SCRIPT_DIR, CACHE_DIR, "all_market")
 # ============================================================================
 class Cfg:
     # 涨停筛选
-    GAIN_MIN = 9.0          # 涨幅下限（准涨停）
-    GAIN_MAX = 10.0         # 涨幅上限
+    GAIN_MIN = 7.0          # 涨幅下限（准涨停）
+    GAIN_MAX = 9.5         # 涨幅上限
     VOL_RATIO_MIN = 3.0     # 量比下限（真金封板）
     OPEN_GAIN_MAX = 5.0     # 开盘涨幅上限（排除一字板）
-    SEAL_RATIO = 0.998      # 收盘/最高 ≥ 此值 = 封板牢固
+    SEAL_RATIO = 0.95      # 收盘/最高 ≥ 此值 = 封板牢固
     AMT_MAX = 10e8          # 日均成交额上限
     FIRST_LIMIT_GAP = 5     # 近N日首次涨停
     MARKET_DROP_MAX = -1.5  # 大盘跌幅下限
